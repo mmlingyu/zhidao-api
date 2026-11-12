@@ -1,0 +1,24 @@
+{
+  "name": "zhidao-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "知岛独立 API：课程生成、账号、知识卡片与 A2UI 编译",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node scripts/check.js",
+    "test": "node test-split.js",
+    "test:cache": "node test-cache.js",
+    "test:redis": "node test-redis.js",
+    "test:users": "node test-users.js",
+    "test:idioms": "node test-idioms.js",
+    "test:a2ui:map": "node test-a2ui-question-map.js",
+    "test:a2ui:server": "node test-a2ui-server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0"
+  }
+}
