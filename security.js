@@ -12,6 +12,25 @@ function isLoopback(req) {
   return ip === '127.0.0.1' || ip === '::1' || ip === 'localhost';
 }
 
+
+function isLocalDevOrigin(origin) {
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+    const parts = host.split('.').map(Number);
+    if (parts.length === 4 && parts.every(n => Number.isInteger(n) && n >= 0 && n <= 255)) {
+      if (parts[0] === 10) return true;
+      if (parts[0] === 192 && parts[1] === 168) return true;
+      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function createSecurity({ config, redis }) {
   const isLocalBind = ['127.0.0.1', 'localhost', '::1'].includes(config.host);
   const origins = config.corsOrigins
@@ -36,8 +55,11 @@ function createSecurity({ config, redis }) {
       // 不在白名单就不返回 ACAO，浏览器会拒绝跨源响应。
       return origins.has(origin) ? { ...common, 'Access-Control-Allow-Origin': origin } : common;
     }
-    // 未配置白名单：仅本机绑定时允许任意来源（开发态 / 预览面板回退场景）。
-    return isLocalBind ? { ...common, 'Access-Control-Allow-Origin': '*' } : common;
+    // 未配置白名单：本机绑定允许任意来源；监听 0.0.0.0 时仍允许本机与局域网来源，
+    // 以便预览面板、其它本地端口的页面能连上 3100，同时不对公网任意站点开放。
+    if (isLocalBind) return { ...common, 'Access-Control-Allow-Origin': '*' };
+    if (isLocalDevOrigin(origin)) return { ...common, 'Access-Control-Allow-Origin': origin };
+    return common;
   }
 
   function adminAllowed(req) {

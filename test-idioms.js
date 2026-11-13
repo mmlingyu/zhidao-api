@@ -58,35 +58,83 @@ check('查询返回权威拼音与释义', () => {
   assert.ok(info && info.meaning.length > 4);
 });
 
+const { preserveTopicIdioms } = require(path.join(__dirname, 'models.js'));
+
 console.log('\n[校验规则]');
-check('自造成语被拦下并给出具体原因', () => {
+check('自造的一项会被替换，其余真成语保留', () => {
   const data = chineseLesson();
   data.idioms[2].word = '蔚蓝天空';
-  assert.throws(() => validateLesson('chinese', data, '天空'), error => {
-    assert.match(error.reason, /蔚蓝天空/);
-    assert.match(error.reason, /真实存在/);
-    return true;
-  });
+  const out = validateLesson('chinese', data, '天空');
+  const words = out.idioms.map(item => item.word);
+  assert.strictEqual(words.length, 4);
+  assert.ok(!words.includes('蔚蓝天空'), words.join(','));
+  assert.ok(words.includes('晴空万里'));
+  assert.ok(words.includes('碧空如洗'));
 });
-check('4 项重复同一词被拦下', () => {
+check('4 项重复同一词时保留一条并用主题候选补齐', () => {
   const data = chineseLesson();
-  // 用一个真实但无意义的四字词重复充数（不是输入词，因此不会被前一条规则拦截）
   for (const item of data.idioms) item.word = '风和日丽';
-  assert.throws(() => validateLesson('chinese', data, '天空'), error => {
-    assert.match(error.reason, /同一个词/);
-    return true;
-  });
+  const out = validateLesson('chinese', data, '天空');
+  const words = out.idioms.map(item => item.word);
+  assert.strictEqual(new Set(words).size, 4);
+  assert.ok(words.includes('风和日丽'));
 });
-check('输入词本身不能当成语', () => {
+check('输入词本身不会留在素材库里，主题能补齐则补齐', () => {
   const data = chineseLesson();
   data.idioms[0].word = '光合作用';
   data.idioms[1].word = '光合作用';
   data.idioms[2].word = '光合作用';
   data.idioms[3].word = '光合作用';
-  assert.throws(() => validateLesson('chinese', data, '光合作用'), error => {
-    assert.match(error.reason, /光合作用/);
-    return true;
+  // 「光合作用」不是成语；若主题候选不足 4 项则报错，够则补齐且不含输入词本身。
+  let out;
+  try {
+    out = validateLesson('chinese', data, '光合作用');
+  } catch (error) {
+    assert.match(error.reason, /恰好 4 项|光合作用/);
+    return;
+  }
+  const words = out.idioms.map(item => item.word);
+  assert.strictEqual(words.length, 4);
+  assert.ok(!words.includes('光合作用'));
+});
+check('词库外但匹配主题的表达会保留（如善解人意）', () => {
+  const data = chineseLesson();
+  data.idioms = [
+    { word: '推心置腹', pinyin: '', tag: '沟通', level: 1, meaning: '', example: '跟妈妈说实话', scene: '谈心' },
+    { word: '心平气和', pinyin: '', tag: '沟通', level: 1, meaning: '', example: '慢慢说', scene: '情绪' },
+    { word: '善解人意', pinyin: '', tag: '沟通', level: 1, meaning: '能体贴别人的心意', example: '先理解妈妈', scene: '体谅' },
+    { word: '娓娓道来', pinyin: '', tag: '沟通', level: 1, meaning: '把话慢慢说清楚', example: '把想法讲给妈妈听', scene: '表达' }
+  ];
+  const out = validateLesson('chinese', data, '如何和妈妈沟通');
+  const words = out.idioms.map(item => item.word);
+  assert.ok(words.includes('推心置腹'));
+  assert.ok(words.includes('心平气和'));
+  assert.ok(words.includes('善解人意'));
+  assert.ok(words.includes('娓娓道来'));
+  assert.ok(!words.includes('海阔天空'), words.join(','));
+});
+check('自愈若改成默认「海阔天空」，会恢复原稿里匹配的表达', () => {
+  const original = JSON.stringify(chineseLesson({
+    idioms: [
+      { word: '推心置腹', pinyin: '', tag: '沟通', level: 1, meaning: '真心交流', example: '', scene: '' },
+      { word: '心平气和', pinyin: '', tag: '沟通', level: 1, meaning: '态度平和', example: '', scene: '' },
+      { word: '开诚布公', pinyin: '', tag: '沟通', level: 1, meaning: '坦诚', example: '', scene: '' },
+      { word: '将心比心', pinyin: '', tag: '沟通', level: 1, meaning: '换位思考', example: '', scene: '' }
+    ]
+  }));
+  const repaired = chineseLesson({
+    idioms: [
+      { word: '水天一色', pinyin: '', tag: '景色', level: 1, meaning: '', example: '', scene: '' },
+      { word: '海阔天空', pinyin: '', tag: '景色', level: 1, meaning: '', example: '', scene: '' },
+      { word: '风和日丽', pinyin: '', tag: '景色', level: 1, meaning: '', example: '', scene: '' },
+      { word: '春暖花开', pinyin: '', tag: '景色', level: 1, meaning: '', example: '', scene: '' }
+    ]
   });
+  const out = preserveTopicIdioms(repaired, original, '如何和妈妈沟通', 'chinese');
+  const words = out.idioms.map(item => item.word);
+  assert.ok(words.includes('推心置腹'), words.join(','));
+  assert.ok(words.includes('心平气和'));
+  assert.ok(!words.includes('海阔天空'), words.join(','));
 });
 check('合格数据通过校验', () => {
   const data = validateLesson('chinese', chineseLesson(), '天空');
@@ -112,13 +160,26 @@ check('idioms 多给一项时裁剪到 4 项', () => {
   const out = validateLesson('chinese', data, '天空');
   assert.strictEqual(out.idioms.length, 4);
 });
-check('idioms 少于 4 项仍然报错', () => {
+check('idioms 少一项时用主题候选补齐到 4 项', () => {
   const data = chineseLesson();
   data.idioms.pop();
-  assert.throws(() => validateLesson('chinese', data, '天空'), error => {
-    assert.match(error.reason, /恰好 4 项/);
-    return true;
-  });
+  const out = validateLesson('chinese', data, '天空');
+  assert.strictEqual(out.idioms.length, 4);
+});
+check('完全没有可用表达且主题也补不齐时仍报错', () => {
+  const data = chineseLesson();
+  data.idioms = [];
+  // 「xyz」没有主题命中，也不允许用海阔天空这类通用兜底来 silently 填满
+  const weird = { ...data, idioms: [] };
+  // 主题「天空」能补齐，所以用一个几乎无意义的输入来验证失败路径
+  let threw = false;
+  try {
+    // 先用空数组 + 无主题输入；candidates(allowGeneric:false) 为空则应失败
+    validateLesson('chinese', chineseLesson({ idioms: [] }), 'xyznotatheme123');
+  } catch (error) {
+    threw = /恰好 4 项/.test(error.reason || error.message);
+  }
+  assert.ok(threw);
 });
 check('英语 items 多给时裁剪到 3 项', () => {
   const data = {
@@ -161,11 +222,18 @@ check('提示词不含模型自造的示例词', () => {
   assert.ok(!prompt.system.includes('蔚蓝天空'));
 });
 check('候选成语全部真实存在于词库', () => {
-  for (const input of ['天空', '开心', '学习', '春天', '植物', '景色']) {
+  for (const input of ['天空', '开心', '学习', '春天', '植物', '景色', '如何和妈妈沟通']) {
     for (const word of idioms.candidates(input, 8)) {
       assert.ok(idioms.isIdiom(word), `${word} 不在词库中`);
     }
   }
+});
+check('「如何和妈妈沟通」给出沟通类成语，而不是默认的海阔天空', () => {
+  const words = idioms.candidates('如何和妈妈沟通', 8, { allowGeneric: false });
+  assert.ok(words.length >= 4, words.join(','));
+  assert.ok(words.includes('推心置腹') || words.includes('心平气和') || words.includes('开诚布公'), words.join(','));
+  assert.ok(!words.includes('海阔天空'), words.join(','));
+  assert.ok(!words.includes('水天一色'), words.join(','));
 });
 
 console.log(`\n全部通过：${passed} 项断言，失败 ${failed} 项。`);

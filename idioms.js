@@ -67,23 +67,70 @@ const THEME_IDIOMS = {
   坚持: ['持之以恒', '锲而不舍', '水滴石穿', '坚持不懈', '力争上游', '再接再厉'],
   景色: ['美不胜收', '目不暇接', '应接不暇', '琳琅满目', '绚丽多彩', '别具一格'],
   成长: ['茁壮成长', '生机勃勃', '欣欣向荣', '蒸蒸日上', '日新月异', '突飞猛进'],
-  春天: ['春暖花开', '万物复苏', '春意盎然', '生机勃勃', '百花齐放', '鸟语花香']
+  春天: ['春暖花开', '万物复苏', '春意盎然', '生机勃勃', '百花齐放', '鸟语花香'],
+  沟通: ['推心置腹', '心平气和', '开诚布公', '畅所欲言', '设身处地', '和颜悦色', '将心比心', '苦口婆心'],
+  交流: ['推心置腹', '开诚布公', '畅所欲言', '娓娓而谈', '设身处地', '将心比心'],
+  说话: ['语重心长', '和颜悦色', '娓娓而谈', '和风细雨', '畅所欲言', '平心静气'],
+  妈妈: ['舐犊情深', '关怀备至', '问寒问暖', '苦口婆心', '语重心长', '循循善诱'],
+  家人: ['舐犊情深', '关怀备至', '问寒问暖', '骨肉相连', '情真意切'],
+  倾听: ['设身处地', '将心比心', '推己及人', '心平气和']
 };
 
-/** 按输入内容挑一组真实成语候选，供提示词与自愈重写使用。 */
-function candidates(input = '', limit = 8) {
-  const text = String(input);
-  const picked = new Set();
+const GENERIC_FALLBACK = ['水天一色', '海阔天空', '风和日丽', '春暖花开', '神采奕奕', '豁然开朗'];
+const INPUT_STOPWORDS = new Set(['如何', '怎么', '怎样', '为什么', '什么', '一个', '一些', '一下', '以及', '关于', '对于', '如果', '因为', '所以', '而且', '这个', '那个', '我们', '他们', '自己', '可以', '应该', '需要', '进行', '还有', '或者', '不是', '没有', '就是', '还是', '的话', '请帮', '帮我', '告诉', '解释', '请问', '帮助']);
+
+/** 从输入里抽出可用于匹配词库的关键词（丢掉「如何」「怎么」等问句词）。 */
+function keywords(input = '') {
+  const text = String(input || '').replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, ' ');
+  const parts = text.split(/[的了呢吗是和与或在把被就都也还及与跟同向]\s*|\s+/).filter(Boolean);
+  return [...new Set(parts.filter(part => part.length >= 2 && !INPUT_STOPWORDS.has(part)))];
+}
+
+function isGenericFallback(words = []) {
+  const list = (Array.isArray(words) ? words : []).map(word => String(word || '').trim());
+  if (!list.length) return false;
+  const hits = list.filter(word => GENERIC_FALLBACK.includes(word)).length;
+  return hits >= 2;
+}
+
+/** 按输入内容挑一组真实成语候选，供提示词与自愈重写使用。
+ *  优先主题表，再按关键词扫词库释义；只有完全没有命中时才用通用兜底。
+ *  options.allowGeneric === false 时不返回「海阔天空」这类与主题无关的默认词。 */
+function candidates(input = '', limit = 8, options = {}) {
+  const text = String(input || '');
+  const allowGeneric = options.allowGeneric !== false;
+  const seen = new Set();
+  const picked = [];
+  const add = (word, score) => {
+    const key = String(word || '').trim();
+    if (!key || seen.has(key) || !load().has(key)) return;
+    seen.add(key);
+    picked.push({ word: key, score: score || 0 });
+  };
   for (const [theme, words] of Object.entries(THEME_IDIOMS)) {
     if (!text.includes(theme)) continue;
-    for (const word of words) picked.add(word);
+    for (const word of words) add(word, 100);
   }
-  // 主题没命中时给一组通用候选，避免提示里没有可照抄的例子。
-  if (!picked.size) {
-    for (const word of ['水天一色', '海阔天空', '风和日丽', '春暖花开', '神采奕奕', '豁然开朗']) picked.add(word);
+  const keys = keywords(text);
+  if (keys.length) {
+    const scored = [];
+    for (const [word, info] of load()) {
+      if (seen.has(word)) continue;
+      let score = 0;
+      const meaning = info.meaning || '';
+      for (const token of keys) {
+        if (word.includes(token)) score += 6;
+        if (meaning.includes(token)) score += 3;
+      }
+      if (score >= 3) scored.push({ word, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    for (const item of scored.slice(0, Math.max(limit * 4, 24))) add(item.word, item.score);
   }
-  const list = [...picked].filter(word => load().has(word));
+  picked.sort((a, b) => b.score - a.score);
+  let list = picked.map(item => item.word);
+  if (!list.length && allowGeneric) list = GENERIC_FALLBACK.filter(word => load().has(word));
   return list.slice(0, limit);
 }
 
-module.exports = { isIdiom, lookup, size, candidates };
+module.exports = { isIdiom, lookup, size, candidates, keywords, isGenericFallback, GENERIC_FALLBACK };

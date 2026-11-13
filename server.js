@@ -104,7 +104,7 @@ const { stageForGrade, uiProfileForGrade, promptForGrade, stageSummary } = requi
 const {
   resolveGeneration, resolveGenerationFor, resolveFallbackGeneration, chatCompletion,
   publicInfo, PROVIDERS, PROMPT_VERSION,
-  buildLessonPrompt, parseModelJson, repairModelJson, validateLesson
+  buildLessonPrompt, buildPreviewPrompt, parseModelJson, repairModelJson, validateLesson, validatePreview, extractLessonPreview, preserveTopicIdioms, collectExpressions, expressionsFromOutput
 } = require('./models');
 const idioms = require('./idioms');
 // A2UI 组件协议：编译器与矩阵都是 UMD 纯函数模块，服务端直接 require 即可。
@@ -293,7 +293,26 @@ function addUsage(a, b) {
 /** 生成 → 规则修复 → Agent 自愈重写 → 备用 provider，并返回累计用量与成本。
  * LFM3-1.7B 常输出半截数组或非法 JSON：先零成本修复，再把错误回传给同一模型重写，
  * 仍不合格才换备用模型；所有尝试（含失败调用）都计入 token / 耗时 / 成本。 */
-async function runGeneration(messages, options, consume, selection = null, lessonInput = '') {
+async function runGeneration(messages, options, consume, selection = null, lessonInput = '', extras = {}) {
+  const onPreview = typeof extras.onPreview === 'function' ? extras.onPreview : null;
+  const previewSubject = extras.subject || '';
+  let previewSent = false;
+  let firstDeltaAt = 0;
+  let previewAt = 0;
+  const maybePreview = text => {
+    if (!firstDeltaAt) {
+      firstDeltaAt = Date.now();
+      console.log(`[preview-flow] 开始收到流式文本 subject=${previewSubject} 本包${String(text || '').length}字`);
+    }
+    if (previewSent || !onPreview || !previewSubject) return;
+    const preview = extractLessonPreview(previewSubject, text);
+    if (!preview) return;
+    previewSent = true;
+    previewAt = Date.now();
+    const desc = String(preview.description || '');
+    console.log(`[preview-flow] 导语已完整、即将出卡 subject=${previewSubject} 累计${String(text || '').length}字 距首包${previewAt - firstDeltaAt}ms 标题=${preview.bannerTitle || preview.title || ''} 导语${desc.length}字`);
+    try { onPreview(preview); } catch (error) { console.warn(`[preview] 回调失败：${error.message}`); }
+  };
   const primary = selection ? selection.primary : config.generation;
   const fallback = selection ? selection.fallback : config.generationFallback;
   const candidates = [primary, fallback].filter(Boolean).filter(candidate => candidate.configured);
@@ -308,7 +327,19 @@ async function runGeneration(messages, options, consume, selection = null, lesso
   for (const candidate of candidates) {
     let result;
     try {
-      result = await chatCompletion(candidate, { ...options, messages, json: true });
+      if (onPreview) {
+        try {
+          result = await chatCompletion(candidate, {
+            ...options, messages, json: true, stream: true, onDelta: maybePreview
+          });
+        } catch (streamError) {
+          if (!streamError.streamUnsupported && streamError.statusCode !== 400) throw streamError;
+          console.warn(`[generation] ${candidate.id} 流式不可用，改用一次性返回：${streamError.message}`);
+          result = await chatCompletion(candidate, { ...options, messages, json: true });
+        }
+      } else {
+        result = await chatCompletion(candidate, { ...options, messages, json: true });
+      }
     } catch (error) {
       attempts.push({ model: candidate.id, stage: 'request', error: error.message });
       console.warn(`[generation] ${candidate.id} 请求失败：${error.message}`);
@@ -320,6 +351,11 @@ async function runGeneration(messages, options, consume, selection = null, lesso
     let latencyMs = result.latencyMs;
     let content = result.content;
     let finalResult = result;
+    const originalContent = content;
+    maybePreview(content);
+    if (!previewSent) {
+      console.warn(`[preview-flow] 流结束后仍未抽出互动讲解卡 subject=${previewSubject} 最终${String(content || '').length}字`);
+    }
     let parsed = tryConsume(content);
     if (!parsed.ok) {
       lastError = parsed.error;
@@ -344,9 +380,16 @@ async function runGeneration(messages, options, consume, selection = null, lesso
         const why = lastError?.reason || lastError?.message || '未知错误';
         // 成语类问题补一份「真实存在的成语候选」：
         // 小模型凭空造词失败率高，给出可照抄的清单后重写几乎必成。
-        const idiomHint = /成语|idioms/.test(why)
-          ? `\n\n可以直接使用下面这些真实存在的成语（不要自己造词）：${idioms.candidates(lessonInput || '', 8).map(w => `「${w}」`).join('、')}`
+        const originalIdioms = expressionsFromOutput(originalContent, lessonInput);
+        const keepHint = originalIdioms.length
+          ? `\n\nidioms 里这些与主题相关的表达请原样保留，不要整组换成「海阔天空」等无关成语：${originalIdioms.map(item => `「${item.word}」`).join('、')}`
           : '';
+        const topicPicks = idioms.candidates(lessonInput || '', 8, { allowGeneric: false });
+        const idiomHint = keepHint + (topicPicks.length
+          ? `\n\n若还需要补齐，请从下面这些与主题接近的真实成语中选择：${topicPicks.map(w => `「${w}」`).join('、')}`
+          : ( /成语|idioms/.test(why)
+            ? `\n\n请选用与当前主题相关的真实四字表达，不要使用「海阔天空」「水天一色」这类与主题无关的默认成语。`
+            : ''));
         const repairMessages = [
           { role: 'system', content: `${system}\n\n你上一次的输出无法解析或未通过校验。请直接重新输出一个完整、合法的 JSON 对象，严格满足全部字段与数量要求；所有数组、对象与字符串必须闭合；不要 Markdown、不要解释文字、不要复述上一次输出、不要输出与当前学科无关的字段。${idiomHint}` },
           // 只回传开头片段：错误信息 + 被截断处的形态足够定位问题，避免把整段坏输出当输入重复计费。
@@ -391,6 +434,9 @@ async function runGeneration(messages, options, consume, selection = null, lesso
       console.warn(`[generation] ${candidate.id} 输出不可用：${lastError?.message}${lastError?.reason ? `（${lastError.reason}）` : ''}`);
       continue;
     }
+    if (previewSubject === 'chinese' && parsed.data) {
+      parsed.data = preserveTopicIdioms(parsed.data, originalContent, lessonInput, 'chinese');
+    }
     return {
       data: parsed.data,
       generation: {
@@ -405,8 +451,15 @@ async function runGeneration(messages, options, consume, selection = null, lesso
   throw lastError || Object.assign(new Error('服务暂不可用，请稍后重试'), { statusCode: 503 });
 }
 
-async function generateLesson(subject, input, selection = null, grade = '') {
-  if (config.mock) return { data: mockLesson(subject, input), generation: null };
+
+async function generateLesson(subject, input, selection = null, grade = '', extras = {}) {
+  if (config.mock) {
+    const data = mockLesson(subject, input);
+    if (typeof extras.onPreview === 'function') {
+      try { extras.onPreview(validatePreview(subject, data)); } catch { /* ignore */ }
+    }
+    return { data, generation: null };
+  }
   const generation = selection ? selection.primary : config.generation;
   const prompt = buildLessonPrompt(subject, input, generation, grade);
   return runGeneration(
@@ -414,7 +467,8 @@ async function generateLesson(subject, input, selection = null, grade = '') {
     { temperature: generation.temperature, maxTokens: generation.maxTokens },
     content => validateLesson(subject, parseModelJson(content), input),
     selection,
-    input
+    input,
+    { onPreview: extras.onPreview, subject }
   );
 }
 
@@ -500,7 +554,10 @@ function compileA2UIForLesson(payload, { grade = '', requested = null } = {}) {
 
     const messages = a2uiCompiler.compileKnowledgeToA2UI(
       { subject, phase, grade, point: knowledge.point, data: knowledge.data },
-      { capabilities, surfaceId: `zhidao_lesson_${subject}_${stage}` }
+      {
+        capabilities, surfaceId: `zhidao_lesson_${subject}_${stage}`,
+        presented: a2uiBridge.presentedFrom(payload)
+      }
     );
     const recipe = messages.meta?.recipe || a2uiMatrix.recipeFor(subject, phase, grade);
     // 和服务端渲染无关，但空态文案必须由数据模型给出（不能用 CSS 藏起来）。
@@ -657,10 +714,35 @@ async function handleTutor(req, res) {
         fallbackReason: route.fallbackReason || route.d1Error || null
       };
       // 阶段 1 一结束就推送真实耗时：前端固定决策时间，并把阶段 2 计时归零后重新开始。
-      emit('stage', { stage: 'route', status: 'done', latencyMs: routeMs, ...routeMeta });
+      emit('stage', { stage: 'route', status: 'done', latencyMs: routeMs, subject: route.subject, confidence: route.confidence, ...routeMeta });
+      // 只调用一次完整生成：流式读取同一份 JSON，第一部分完整即推送 preview（json-render）。
+      let previewEmitted = false;
+      let previewEmittedAt = 0;
       const lessonStarted = Date.now();
-      const generated = await generateLesson(route.subject, input, selection, learner?.grade || '');
+      const emitPreview = (data, meta = {}) => {
+        if (previewEmitted || !data) return;
+        if (!emitStage) {
+          console.warn(`[preview-flow] 请求未开 stageEvents，无法提前推送互动讲解卡 subject=${route.subject}`);
+          return;
+        }
+        if (typeof res !== 'undefined' && (res.writableEnded || res.destroyed)) return;
+        previewEmitted = true;
+        previewEmittedAt = Date.now();
+        const latencyMs = meta.latencyMs || (previewEmittedAt - lessonStarted);
+        console.log(`[preview-flow] 已推送互动讲解卡 subject=${route.subject} 距讲解开始${latencyMs}ms 来源=${meta.source || 'json-stream'} 标题=${data.bannerTitle || data.title || ''}`);
+        emit('preview', {
+          subject: route.subject, input, data,
+          confidence: route.confidence,
+          latencyMs,
+          source: meta.source || 'json-stream'
+        });
+      };
+      const generated = await generateLesson(route.subject, input, selection, learner?.grade || '', {
+        onPreview: data => emitPreview(data, { source: 'json-stream' })
+      });
       const lessonMs = Date.now() - lessonStarted;
+      const leadMs = previewEmitted && previewEmittedAt ? (Date.now() - previewEmittedAt) : 0;
+      console.log(`[preview-flow] 完整课已生成 subject=${route.subject} 讲解${lessonMs}ms 提前出卡=${previewEmitted} 领先完整课${leadMs}ms`);
       const used = generated.generation;
       const lessonModel = config.mock ? 'mock' : (used?.model || selection.primary.model);
       const lessonProvider = config.mock ? 'mock' : (used?.provider || selection.primary.provider);
@@ -735,7 +817,7 @@ async function handleTutor(req, res) {
     }
     if (emitStage) {
       // 缓存命中不会执行生成回调，直接把首次生成的两段耗时推给前端。
-      if (cacheMeta.hit) emit('stage', { stage: 'cached', timings: payload.timings, source: cacheMeta.source });
+      if (cacheMeta.hit) emit('stage', { stage: 'cached', timings: payload.timings, source: cacheMeta.source, subject: payload.subject, confidence: payload.route && payload.route.confidence });
       // 完整消息流仍保留单条事件（旧客户端 / 回归测试依赖它），渐进事件是叠加通道。
       if (a2ui) emit('a2ui', {
         surfaceId: a2ui.surfaceId, uiVersion: a2ui.uiVersion,
@@ -1138,6 +1220,9 @@ function sendJson(res, status, data, extraHeaders = {}) {
  * 学科决策一结束就推送真实耗时，前端据此结束阶段 1 并从 0 开始阶段 2 计时，
  * 避免前端只能拿一个总秒表同时填两行、看起来像并行。 */
 function startStageStream(res) {
+  if (res.socket && typeof res.socket.setNoDelay === 'function') {
+    try { res.socket.setNoDelay(true); } catch { /* ignore */ }
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -1145,10 +1230,20 @@ function startStageStream(res) {
     'X-Accel-Buffering': 'no',
     'X-Content-Type-Options': 'nosniff'
   });
+  if (typeof res.flushHeaders === 'function') {
+    try { res.flushHeaders(); } catch { /* ignore */ }
+  }
+  const flush = () => {
+    if (typeof res.flush === 'function') {
+      try { res.flush(); } catch { /* ignore */ }
+    }
+  };
   res.write(': zhidao stage stream\n\n');
+  flush();
   const emit = (event, data) => {
     if (res.writableEnded || res.destroyed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    flush();
   };
   return emit;
 }
@@ -1245,7 +1340,7 @@ function serveStatic(req, res) {
     '/grade-profile.js', '/feedback.js', '/learner.js', '/knowledge-client.js', '/knowledge.css',
     '/a2ui-catalog.js', '/a2ui-matrix.js', '/a2ui-question-map.js',
     '/a2ui-p4a.js', '/a2ui-p4b.js', '/a2ui-p4c.js', '/a2ui-p4d.js', '/a2ui-games.js',
-    '/a2ui-compiler.js', '/a2ui-render.js', '/a2ui-play.js', '/a2ui-stream.js', '/a2ui-bridge.js',
+    '/a2ui-validate.js', '/a2ui-compiler.js', '/a2ui-render.js', '/a2ui-play.js', '/a2ui-stream.js', '/a2ui-bridge.js',
     '/config.js', '/api-config.js', '/sw.js', '/manifest.webmanifest', '/icon.svg']);
   // 人脸模型与 wasm 放在 public/ 下由构建脚本拷贝，浏览器端需要直接加载。
   // /tts/ 是浏览器离线语音引擎（引擎包、ONNX Runtime、音色、模型），同样从 public/ 提供。
